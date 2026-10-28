@@ -1,12 +1,5 @@
 /**
- * NUMA · Servidor de notificaciones push
- *
- * - Recibe tokens de la app en POST /register
- * - Sondea Epic Games cada 60s buscando juegos gratis
- * - Envía push vía Expo Push API cuando aparece uno nuevo
- * - Persiste tokens y juegos vistos en archivos JSON
- *   (en Render free tier el disco es efímero, pero los tokens
- *   se re-registran solos cuando la app vuelve a abrir)
+ * NUMA · Servidor de notificaciones push y API de juegos
  */
 
 const express = require('express');
@@ -38,6 +31,8 @@ const expo = new Expo({ accessToken: EXPO_ACCESS_TOKEN });
 const tokens = new Map();
 /** Set de gameId ya notificados */
 const seenGames = new Set();
+/** Caché de detalles completos (requisitos) -> gameId: { systemRequirements } */
+const gameDetailsCache = new Map();
 
 function load() {
   try {
@@ -114,6 +109,17 @@ app.post('/unregister', (req, res) => {
   res.json({ ok: true });
 });
 
+// Endpoint para que la app obtenga la lista de juegos con requisitos
+let latestGames = [];
+app.get('/games', (_req, res) => {
+  // Combinamos la lista base con los detalles cacheados
+  const enrichedGames = latestGames.map(g => ({
+    ...g,
+    ...(gameDetailsCache.get(g.id) || {}),
+  }));
+  res.json({ ok: true, games: enrichedGames, updatedAt: Date.now() });
+});
+
 // ---------- Epic Games ----------
 
 function buildStoreUrl(el) {
@@ -122,7 +128,6 @@ function buildStoreUrl(el) {
     el.urlSlug ||
     (el.catalogNs && el.catalogNs.mappings && el.catalogNs.mappings[0] && el.catalogNs.mappings[0].pageSlug) ||
     el.id;
-  // productSlug puede venir con "/home" al final
   const clean = String(slug).replace(/\/home$/, '');
   return `https://store.epicgames.com/${LOCALE}/p/${clean}`;
 }
@@ -146,16 +151,54 @@ async function fetchFreeGames() {
             id: String(el.id),
             title: el.title,
             description: el.description,
+            publisher: el.seller?.name || 'Desconocido',
+            image: el.keyImages?.find(img => img.type === 'Thumbnail')?.url || el.keyImages?.[0]?.url,
+            originalPrice: el.price?.totalPrice?.fmtPrice?.originalPrice,
             url: buildStoreUrl(el),
+            start: el.promotions?.upcomingPromotionalOffers?.[0]?.promotionalOffers?.[0]?.startDate || new Date().toISOString(),
+            end: o.endDate,
           });
         }
       }
     }
   }
-  // deduplicar por id
   const byId = new Map();
   for (const g of free) byId.set(g.id, g);
   return [...byId.values()];
+}
+
+async function fetchGameRequirements(gameId) {
+  const query = `
+    query searchStoreQuery($id: String!, $country: String!, $locale: String!) {
+      Catalog {
+        searchStore(id: $id, country: $country, locale: $locale) {
+          elements {
+            id
+            systemRequirements {
+              minimum { os processor memory graphics storage }
+              recommended { os processor memory graphics storage }
+            }
+          }
+        }
+      }
+    }
+  `;
+  try {
+    const res = await fetch('https://graphql.epicgames.com/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        query,
+        variables: { id: gameId, country: COUNTRY, locale: LOCALE },
+      }),
+    });
+    const json = await res.json();
+    const element = json?.data?.Catalog?.searchStore?.elements?.[0];
+    return element?.systemRequirements || null;
+  } catch (e) {
+    console.error(`[requirements] Error para ${gameId}:`, e);
+    return null;
+  }
 }
 
 // ---------- Ciclo de notificaciones ----------
@@ -167,6 +210,18 @@ async function checkAndNotify() {
   checking = true;
   try {
     const free = await fetchFreeGames();
+    latestGames = free; // Guardamos la última lista
+
+    // Buscamos requisitos para juegos que no estén en caché
+    for (const g of free) {
+      if (!gameDetailsCache.has(g.id)) {
+        const reqs = await fetchGameRequirements(g.id);
+        if (reqs) {
+          gameDetailsCache.set(g.id, { systemRequirements: reqs });
+        }
+      }
+    }
+
     const newGames = free.filter((g) => !seenGames.has(g.id));
 
     if (newGames.length === 0) {
