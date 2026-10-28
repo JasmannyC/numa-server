@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: numa-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: COUNTRY
+        value: EC
+      - key: LOCALE
+        value: es-EC
+      - key: POLL_INTERVAL_MS
+        value: "60000"
